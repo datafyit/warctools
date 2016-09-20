@@ -1,7 +1,10 @@
 """Read records from normal file and compressed file"""
 
 import gzip
+import io
 import re
+
+import sys
 
 from hanzo.warctools.archive_detect import is_gzip_file, guess_record_type
 
@@ -180,6 +183,7 @@ class RecordStream(object):
 
 CHUNK_SIZE = 8192 # the size to read in, make this bigger things go faster.
 
+
 class GeeZipFile(gzip.GzipFile):
     """Extends gzip.GzipFile to remember self.member_offset, the raw file
     offset of the current gzip member."""
@@ -188,7 +192,18 @@ class GeeZipFile(gzip.GzipFile):
                  compresslevel=9, fileobj=None, mtime=None):
         # ignore mtime for python 2.6
         gzip.GzipFile.__init__(self, filename=filename, mode=mode, compresslevel=compresslevel, fileobj=fileobj)
-        self.member_offset = None
+        self._member_offset = None
+
+        if sys.version_info >= (3, 5) and self.mode == gzip.READ:
+            from gzip import _GzipReader
+
+            class _MemberOffsetGzipReader(_GzipReader):
+                def _read_gzip_header(self):
+                    self.member_offset = self._fp.file.tell() - self._fp._length + (self._fp._read or 0)
+                    return super(_MemberOffsetGzipReader, self)._read_gzip_header()
+
+            raw = _MemberOffsetGzipReader(self.fileobj)
+            self._buffer = io.BufferedReader(raw)
 
     # hook in to the place we seem to be able to reliably get the raw gzip
     # member offset
@@ -196,12 +211,19 @@ class GeeZipFile(gzip.GzipFile):
         if self._new_member:
             try:
                 # works for python3.2
-                self.member_offset = self.fileobj.tell() - self.fileobj._length + (self.fileobj._read or 0)
+                self._member_offset = self.fileobj.tell() - self.fileobj._length + (self.fileobj._read or 0)
             except AttributeError:
                 # works for python2.7
-                self.member_offset = self.fileobj.tell()
+                self._member_offset = self.fileobj.tell()
 
         return gzip.GzipFile._read(self, size)
+
+    @property
+    def member_offset(self):
+        if sys.version_info < (3, 5):
+            return self._member_offset
+        else:
+            return self._buffer.raw.member_offset
 
 class GzipRecordStream(RecordStream):
     """A stream to read/write concatted file made up of gzipped
@@ -233,6 +255,10 @@ class GzipRecordStream(RecordStream):
         self.raw_fh.seek(offset, pos)
         # trick to avoid closing and recreating GzipFile, does it always work?
         self.fh._new_member = True
+
+    def close(self):
+        super(GzipRecordStream, self).close()
+        self.raw_fh.close()
 
 class GzipFileStream(RecordStream):
     """A stream to read/write gzipped file made up of all archive records"""
